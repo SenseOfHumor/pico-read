@@ -2,6 +2,8 @@
 #include "display.h"
 #include "sdkconfig.h"
 
+#include "driver/gpio.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,13 +25,28 @@ LV_FONT_DECLARE(lv_font_montserrat_32);
 LV_FONT_DECLARE(lv_font_montserrat_40);
 #endif
 
-#define WPM 500
-#define MS_PER_WORD (60000 / WPM)
+#define DEFAULT_WPM 300
+#define WPM_STEP 50
+#define WPM_MIN 50
+#define WPM_MAX 1000
+
+#define BOOT_BUTTON_GPIO GPIO_NUM_9
+#define BOOT_BUTTON_ACTIVE_LEVEL 0
+#define BUTTON_POLL_MS 20
+#define BUTTON_DEBOUNCE_MS 30
+#define BUTTON_LONG_PRESS_MS 1000
+#define BUTTON_DOUBLE_CLICK_MS 300
+
+#define BG_COLOR 0x000000
 #define GUIDE_COLOR 0x909090
 #define WORD_COLOR 0xD8D8D8
 #define ANCHOR_GLOW_COLOR 0xC76868
 #define ANCHOR_COLOR 0xD88484
 #define SPEED_COLOR 0x707070
+#define MENU_TEXT_COLOR 0xB8B8B8
+#define MENU_HIGHLIGHT_COLOR 0xD88484
+#define MENU_SUBTEXT_COLOR 0x707070
+
 #define GUIDE_MARGIN_X 6
 #define GUIDE_TOP_Y 25
 #define GUIDE_BOTTOM_Y -25
@@ -46,6 +63,32 @@ static uint16_t punctuation_pause_ms = 500;
 static uint8_t word_opacity_percent = 100;
 /* Adjust this manually to tune guideline opacity. Range: 0..100 percent */
 static uint8_t guide_opacity_percent = 50;
+/* Adjust this manually to set the default reading speed. Units: words per minute */
+static uint16_t reading_speed_wpm = DEFAULT_WPM;
+
+typedef enum {
+    UI_SCREEN_MENU = 0,
+    UI_SCREEN_BOOKS,
+    UI_SCREEN_SPEED,
+    UI_SCREEN_BOOKMARKS,
+    UI_SCREEN_READER,
+} ui_screen_t;
+
+static const char *menu_items[] = {
+    "Books",
+    "Set reading speed",
+    "Bookmarks",
+};
+
+static const char *book_items[] = {
+    "paragraph.txt",
+};
+
+static ui_screen_t current_screen = UI_SCREEN_MENU;
+static ui_screen_t screen_stack[4];
+static uint8_t screen_stack_len;
+static uint8_t root_menu_index;
+static uint8_t book_menu_index;
 
 static lv_obj_t *left_label;
 static lv_obj_t *left_bold_label;
@@ -55,6 +98,9 @@ static lv_obj_t *right_label;
 static lv_obj_t *right_bold_label;
 static lv_obj_t *speed_label;
 
+static lv_timer_t *reader_timer;
+static lv_timer_t *button_timer;
+
 static char token_buf[DISPLAY_TOKEN_MAX_LEN];
 static size_t max_word_len;
 static char *word_buf;
@@ -62,6 +108,16 @@ static char *left_buf;
 static char *right_buf;
 static char anchor_buf[2];
 static lv_coord_t word_max_width;
+static size_t pending_token_len;
+static size_t pending_token_offset;
+
+static bool button_raw_pressed;
+static bool button_stable_pressed;
+static bool button_long_fired;
+static uint8_t pending_clicks;
+static uint32_t button_change_tick;
+static uint32_t button_press_tick;
+static uint32_t last_click_tick;
 
 static lv_opa_t opacity_percent_to_lv(uint8_t percent)
 {
@@ -71,24 +127,30 @@ static lv_opa_t opacity_percent_to_lv(uint8_t percent)
     return (lv_opa_t)((percent * LV_OPA_COVER) / 100);
 }
 
+static uint32_t get_base_word_delay_ms(void)
+{
+    uint16_t wpm = reading_speed_wpm ? reading_speed_wpm : DEFAULT_WPM;
+    return 60000U / wpm;
+}
+
 static uint32_t get_word_delay_ms(const char *word)
 {
     size_t len = strlen(word);
     if (len == 0) {
-        return MS_PER_WORD;
+        return get_base_word_delay_ms();
     }
 
     for (size_t i = len; i > 0; i--) {
         char ch = word[i - 1];
         if (ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == '!' || ch == '?') {
-            return MS_PER_WORD + punctuation_pause_ms;
+            return get_base_word_delay_ms() + punctuation_pause_ms;
         }
         if (isalnum((unsigned char)ch)) {
             break;
         }
     }
 
-    return MS_PER_WORD;
+    return get_base_word_delay_ms();
 }
 
 static const lv_font_t *get_word_font(void)
@@ -105,8 +167,17 @@ static const lv_font_t *get_word_font(void)
     case 40:
         return &lv_font_montserrat_40;
     default:
-        return &lv_font_montserrat_40;
+        return &lv_font_montserrat_32;
     }
+}
+
+static const lv_font_t *get_menu_font(void)
+{
+#if CONFIG_LV_FONT_MONTSERRAT_24
+    return &lv_font_montserrat_24;
+#else
+    return &lv_font_montserrat_16;
+#endif
 }
 
 static void sync_word_positions(void)
@@ -153,8 +224,6 @@ static size_t find_chunk_len(const char *word, size_t len, const lv_font_t *font
 static bool next_chunk(char **chunk_start, size_t *chunk_len)
 {
     const lv_font_t *word_font = get_word_font();
-    static size_t pending_token_len;
-    static size_t pending_token_offset;
 
     if (pending_token_offset < pending_token_len) {
         *chunk_start = token_buf + pending_token_offset;
@@ -178,28 +247,51 @@ static bool next_chunk(char **chunk_start, size_t *chunk_len)
     return next_chunk(chunk_start, chunk_len);
 }
 
-static void build_word_list(void)
+static void prepare_reader_buffers(void)
 {
-    max_word_len = DISPLAY_TOKEN_MAX_LEN - 1;
-    display_reset();
+    pending_token_len = 0;
+    pending_token_offset = 0;
 
-    word_buf = (char *)malloc(max_word_len + 1);
-    left_buf = (char *)malloc(max_word_len + 1);
-    right_buf = (char *)malloc(max_word_len + 1);
-    if (!word_buf || !left_buf || !right_buf) {
+    if (word_buf && left_buf && right_buf) {
+        display_reset();
         return;
     }
 
+    max_word_len = DISPLAY_TOKEN_MAX_LEN - 1;
+    word_buf = malloc(max_word_len + 1);
+    left_buf = malloc(max_word_len + 1);
+    right_buf = malloc(max_word_len + 1);
+    display_reset();
+}
+
+static void push_screen(ui_screen_t next_screen)
+{
+    if (screen_stack_len < (sizeof(screen_stack) / sizeof(screen_stack[0]))) {
+        screen_stack[screen_stack_len++] = current_screen;
+    }
+    current_screen = next_screen;
+}
+
+static void pop_screen(void)
+{
+    if (screen_stack_len == 0) {
+        current_screen = UI_SCREEN_MENU;
+        return;
+    }
+
+    current_screen = screen_stack[--screen_stack_len];
 }
 
 static void format_word(const char *word)
 {
     size_t len = strlen(word);
+    size_t anchor_idx;
+
     if (len == 0 || !left_buf || !right_buf) {
         return;
     }
 
-    size_t anchor_idx = (len - 1) / 2;
+    anchor_idx = (len - 1) / 2;
 
     memcpy(left_buf, word, anchor_idx);
     left_buf[anchor_idx] = '\0';
@@ -211,10 +303,8 @@ static void format_word(const char *word)
 
     lv_label_set_text(left_bold_label, left_buf);
     lv_label_set_text(left_label, left_buf);
-
     lv_label_set_text(anchor_bold_label, anchor_buf);
     lv_label_set_text(anchor_label, anchor_buf);
-
     lv_label_set_text(right_bold_label, right_buf);
     lv_label_set_text(right_label, right_buf);
 
@@ -264,31 +354,122 @@ static lv_obj_t *create_guide(lv_obj_t *parent, lv_coord_t width, lv_coord_t hei
     return guide;
 }
 
-void display_words_start(void)
+static lv_obj_t *create_text(lv_obj_t *parent, const char *text, const lv_font_t *font, uint32_t color_hex)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(color_hex), 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    return label;
+}
+
+static void stop_reader_timer(void)
+{
+    if (reader_timer) {
+        lv_timer_del(reader_timer);
+        reader_timer = NULL;
+    }
+}
+
+static void reset_reader_objects(void)
+{
+    left_label = NULL;
+    left_bold_label = NULL;
+    anchor_label = NULL;
+    anchor_bold_label = NULL;
+    right_label = NULL;
+    right_bold_label = NULL;
+    speed_label = NULL;
+}
+
+static void render_root_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    lv_obj_t *title = create_text(screen, "Menu", menu_font, MENU_HIGHLIGHT_COLOR);
+    lv_coord_t y = 52;
+
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+
+    for (size_t i = 0; i < sizeof(menu_items) / sizeof(menu_items[0]); i++) {
+        uint32_t color = (i == root_menu_index) ? MENU_HIGHLIGHT_COLOR : MENU_TEXT_COLOR;
+        lv_obj_t *label = create_text(screen, menu_items[i], menu_font, color);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, y);
+        y += 36;
+    }
+
+    lv_obj_t *hint = create_text(screen, "Press next  Hold select  Double back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+}
+
+static void render_books_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    lv_obj_t *title = create_text(screen, "Books", menu_font, MENU_HIGHLIGHT_COLOR);
+    lv_obj_t *book = create_text(screen, book_items[book_menu_index], menu_font, MENU_HIGHLIGHT_COLOR);
+    lv_obj_t *hint = create_text(screen, "Hold to open", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(book, LV_ALIGN_CENTER, 0, -6);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+static void render_speed_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    char speed_text[32];
+    lv_obj_t *title = create_text(screen, "Reading speed", menu_font, MENU_HIGHLIGHT_COLOR);
+    lv_obj_t *subtitle = create_text(screen, "Single press adds 50 WPM", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+    lv_obj_t *hint = create_text(screen, "Hold to save  Double to go back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+    lv_obj_t *value;
+
+    snprintf(speed_text, sizeof(speed_text), "%u WPM", reading_speed_wpm);
+    value = create_text(screen, speed_text, menu_font, MENU_TEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(value, LV_ALIGN_CENTER, 0, -8);
+    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 26);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+static void render_bookmarks_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    lv_obj_t *title = create_text(screen, "Bookmarks", menu_font, MENU_HIGHLIGHT_COLOR);
+    lv_obj_t *empty = create_text(screen, "Empty for now", menu_font, MENU_TEXT_COLOR);
+    lv_obj_t *hint = create_text(screen, "Double to go back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(empty, LV_ALIGN_CENTER, 0, -4);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+static void render_reader_screen(lv_obj_t *screen)
 {
     const lv_font_t *word_font = get_word_font();
-    lv_obj_t *screen = lv_scr_act();
     lv_coord_t screen_w = lv_obj_get_width(screen);
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+    lv_obj_t *top_guide;
+    lv_obj_t *bottom_guide;
+    lv_obj_t *top_tick;
+    lv_obj_t *bottom_tick;
+
     word_max_width = screen_w - (WORD_SIDE_MARGIN * 2);
+    prepare_reader_buffers();
 
-    build_word_list();
-
-    lv_obj_t *top_guide = create_guide(screen, screen_w - (GUIDE_MARGIN_X * 2), GUIDE_THICKNESS);
+    top_guide = create_guide(screen, screen_w - (GUIDE_MARGIN_X * 2), GUIDE_THICKNESS);
     lv_obj_align(top_guide, LV_ALIGN_TOP_MID, 0, GUIDE_TOP_Y);
 
-    lv_obj_t *bottom_guide = create_guide(screen, screen_w - (GUIDE_MARGIN_X * 2), GUIDE_THICKNESS);
+    bottom_guide = create_guide(screen, screen_w - (GUIDE_MARGIN_X * 2), GUIDE_THICKNESS);
     lv_obj_align(bottom_guide, LV_ALIGN_BOTTOM_MID, 0, GUIDE_BOTTOM_Y);
 
-    lv_obj_t *top_tick = create_guide(screen, GUIDE_THICKNESS, GUIDE_TICK_LEN);
+    top_tick = create_guide(screen, GUIDE_THICKNESS, GUIDE_TICK_LEN);
     lv_obj_align_to(top_tick, top_guide, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
 
-    lv_obj_t *bottom_tick = create_guide(screen, GUIDE_THICKNESS, GUIDE_TICK_LEN);
+    bottom_tick = create_guide(screen, GUIDE_THICKNESS, GUIDE_TICK_LEN);
     lv_obj_align_to(bottom_tick, bottom_guide, LV_ALIGN_OUT_TOP_MID, 0, 0);
 
     speed_label = lv_label_create(screen);
-    lv_label_set_text_fmt(speed_label, "%d WPM", WPM);
+    lv_label_set_text_fmt(speed_label, "%u WPM", reading_speed_wpm);
     lv_obj_set_style_text_color(speed_label, lv_color_hex(SPEED_COLOR), 0);
     lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_12, 0);
     lv_obj_align(speed_label, LV_ALIGN_BOTTOM_RIGHT, -14, -4);
@@ -312,5 +493,182 @@ void display_words_start(void)
     style_word_label(right_label, word_font, lv_color_hex(WORD_COLOR));
 
     next_word_cb(NULL);
-    lv_timer_create(next_word_cb, MS_PER_WORD, NULL);
+    reader_timer = lv_timer_create(next_word_cb, get_base_word_delay_ms(), NULL);
+}
+
+static void render_current_screen(void)
+{
+    lv_obj_t *screen = lv_scr_act();
+
+    stop_reader_timer();
+    reset_reader_objects();
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(BG_COLOR), 0);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+    switch (current_screen) {
+    case UI_SCREEN_MENU:
+        render_root_menu(screen);
+        break;
+    case UI_SCREEN_BOOKS:
+        render_books_menu(screen);
+        break;
+    case UI_SCREEN_SPEED:
+        render_speed_menu(screen);
+        break;
+    case UI_SCREEN_BOOKMARKS:
+        render_bookmarks_menu(screen);
+        break;
+    case UI_SCREEN_READER:
+        render_reader_screen(screen);
+        break;
+    }
+}
+
+static void handle_single_press(void)
+{
+    switch (current_screen) {
+    case UI_SCREEN_MENU:
+        root_menu_index = (root_menu_index + 1) % (sizeof(menu_items) / sizeof(menu_items[0]));
+        render_current_screen();
+        break;
+    case UI_SCREEN_BOOKS:
+        book_menu_index = (book_menu_index + 1) % (sizeof(book_items) / sizeof(book_items[0]));
+        render_current_screen();
+        break;
+    case UI_SCREEN_SPEED:
+        reading_speed_wpm += WPM_STEP;
+        if (reading_speed_wpm > WPM_MAX) {
+            reading_speed_wpm = WPM_MIN;
+        }
+        render_current_screen();
+        break;
+    case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_READER:
+        break;
+    }
+}
+
+static void handle_long_press(void)
+{
+    switch (current_screen) {
+    case UI_SCREEN_MENU:
+        switch (root_menu_index) {
+        case 0:
+            push_screen(UI_SCREEN_BOOKS);
+            break;
+        case 1:
+            push_screen(UI_SCREEN_SPEED);
+            break;
+        case 2:
+            push_screen(UI_SCREEN_BOOKMARKS);
+            break;
+        default:
+            current_screen = UI_SCREEN_MENU;
+            break;
+        }
+        render_current_screen();
+        break;
+    case UI_SCREEN_BOOKS:
+        push_screen(UI_SCREEN_READER);
+        render_current_screen();
+        break;
+    case UI_SCREEN_SPEED:
+        pop_screen();
+        render_current_screen();
+        break;
+    case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_READER:
+        break;
+    }
+}
+
+static void handle_double_click(void)
+{
+    switch (current_screen) {
+    case UI_SCREEN_MENU:
+        break;
+    case UI_SCREEN_BOOKS:
+    case UI_SCREEN_SPEED:
+    case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_READER:
+        pop_screen();
+        render_current_screen();
+        break;
+    }
+}
+
+static void button_poll_cb(lv_timer_t *timer)
+{
+    bool raw_pressed;
+    uint32_t now = lv_tick_get();
+
+    (void)timer;
+    raw_pressed = (gpio_get_level(BOOT_BUTTON_GPIO) == BOOT_BUTTON_ACTIVE_LEVEL);
+
+    if (raw_pressed != button_raw_pressed) {
+        button_raw_pressed = raw_pressed;
+        button_change_tick = now;
+    }
+
+    if ((now - button_change_tick) < BUTTON_DEBOUNCE_MS) {
+        goto finalize_clicks;
+    }
+
+    if (button_stable_pressed != button_raw_pressed) {
+        button_stable_pressed = button_raw_pressed;
+
+        if (button_stable_pressed) {
+            button_press_tick = now;
+            button_long_fired = false;
+        } else if (!button_long_fired) {
+            if (pending_clicks == 1 && (now - last_click_tick) <= BUTTON_DOUBLE_CLICK_MS) {
+                pending_clicks = 0;
+                handle_double_click();
+            } else {
+                pending_clicks = 1;
+                last_click_tick = now;
+            }
+        }
+    }
+
+    if (button_stable_pressed && !button_long_fired && (now - button_press_tick) >= BUTTON_LONG_PRESS_MS) {
+        button_long_fired = true;
+        pending_clicks = 0;
+        handle_long_press();
+    }
+
+finalize_clicks:
+    if (pending_clicks == 1 && (now - last_click_tick) > BUTTON_DOUBLE_CLICK_MS) {
+        pending_clicks = 0;
+        handle_single_press();
+    }
+}
+
+static void init_boot_button(void)
+{
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_GPIO),
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+
+    gpio_config(&io_conf);
+}
+
+void display_words_start(void)
+{
+    init_boot_button();
+
+    if (!button_timer) {
+        button_timer = lv_timer_create(button_poll_cb, BUTTON_POLL_MS, NULL);
+    }
+
+    current_screen = UI_SCREEN_MENU;
+    screen_stack_len = 0;
+    root_menu_index = 0;
+    book_menu_index = 0;
+    render_current_screen();
 }
