@@ -2,9 +2,12 @@
 
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 #include <dirent.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +17,8 @@
 
 static const char *TAG = "BOOK_STORAGE";
 static char s_fallback_text[96] = "BOOK ERR";
+static const char *BOOKMARK_NS = "reader";
+static const char *BOOKMARK_KEY = "bookmarks";
 
 static bool s_mounted;
 static FILE *s_book_file;
@@ -23,10 +28,107 @@ static size_t s_book_count;
 static size_t s_selected_book_index;
 static size_t s_total_bytes;
 static size_t s_used_bytes;
+static nvs_handle_t s_nvs_handle;
+static bool s_nvs_ready;
+
+typedef struct {
+    char book_name[DISPLAY_BOOK_NAME_MAX];
+    uint32_t offset;
+} bookmark_entry_t;
+
+typedef struct {
+    uint32_t version;
+    uint32_t count;
+    bookmark_entry_t entries[DISPLAY_MAX_BOOKS];
+} bookmark_blob_t;
+
+static bookmark_blob_t s_bookmarks;
 
 static void set_fallback_text(const char *message)
 {
     snprintf(s_fallback_text, sizeof(s_fallback_text), "%s", message);
+}
+
+static void init_bookmarks(void)
+{
+    esp_err_t err;
+    size_t required_size = sizeof(s_bookmarks);
+
+    memset(&s_bookmarks, 0, sizeof(s_bookmarks));
+    s_bookmarks.version = 1;
+
+    err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    err = nvs_open(BOOKMARK_NS, NVS_READWRITE, &s_nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_nvs_ready = true;
+
+    err = nvs_get_blob(s_nvs_handle, BOOKMARK_KEY, &s_bookmarks, &required_size);
+    if (err != ESP_OK || required_size != sizeof(s_bookmarks) || s_bookmarks.version != 1) {
+        memset(&s_bookmarks, 0, sizeof(s_bookmarks));
+        s_bookmarks.version = 1;
+    }
+}
+
+static int find_bookmark_index(const char *book_name)
+{
+    for (uint32_t i = 0; i < s_bookmarks.count && i < DISPLAY_MAX_BOOKS; i++) {
+        if (strcmp(s_bookmarks.entries[i].book_name, book_name) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static uint32_t get_saved_offset_for_book(const char *book_name)
+{
+    int index = find_bookmark_index(book_name);
+    if (index < 0) {
+        return 0;
+    }
+    return s_bookmarks.entries[index].offset;
+}
+
+static void persist_bookmarks(void)
+{
+    if (!s_nvs_ready) {
+        return;
+    }
+    nvs_set_blob(s_nvs_handle, BOOKMARK_KEY, &s_bookmarks, sizeof(s_bookmarks));
+    nvs_commit(s_nvs_handle);
+}
+
+static void set_saved_offset_for_book(const char *book_name, uint32_t offset)
+{
+    int index;
+
+    if (!book_name || !s_nvs_ready) {
+        return;
+    }
+
+    index = find_bookmark_index(book_name);
+    if (index < 0) {
+        if (s_bookmarks.count >= DISPLAY_MAX_BOOKS) {
+            return;
+        }
+        index = (int)s_bookmarks.count++;
+        strncpy(s_bookmarks.entries[index].book_name, book_name, DISPLAY_BOOK_NAME_MAX - 1);
+        s_bookmarks.entries[index].book_name[DISPLAY_BOOK_NAME_MAX - 1] = '\0';
+    }
+
+    s_bookmarks.entries[index].offset = offset;
+    persist_bookmarks();
 }
 
 static void update_storage_info(void)
@@ -123,6 +225,8 @@ static void scan_books(void)
 static bool open_book_by_index(size_t index)
 {
     char path[DISPLAY_BOOK_NAME_MAX + 32];
+    long file_size;
+    uint32_t saved_offset;
 
     if (index >= s_book_count) {
         set_fallback_text("BOOK INDEX FAIL");
@@ -139,6 +243,17 @@ static bool open_book_by_index(size_t index)
     }
 
     s_selected_book_index = index;
+    saved_offset = get_saved_offset_for_book(s_book_names[index]);
+    if (fseek(s_book_file, 0, SEEK_END) == 0) {
+        file_size = ftell(s_book_file);
+        if (file_size >= 0 && saved_offset < (uint32_t)file_size) {
+            fseek(s_book_file, (long)saved_offset, SEEK_SET);
+        } else {
+            rewind(s_book_file);
+        }
+    } else {
+        rewind(s_book_file);
+    }
     ESP_LOGI(TAG, "Opened %s for streaming", path);
     return true;
 }
@@ -164,6 +279,7 @@ bool display_init(void)
         return false;
     }
     s_mounted = true;
+    init_bookmarks();
 
     update_storage_info();
     scan_books();
@@ -185,7 +301,10 @@ bool display_init(void)
 void display_reset(void)
 {
     if (s_book_file) {
-        rewind(s_book_file);
+        uint32_t saved_offset = get_saved_offset_for_book(s_book_names[s_selected_book_index]);
+        if (fseek(s_book_file, (long)saved_offset, SEEK_SET) != 0) {
+            rewind(s_book_file);
+        }
     }
     s_fallback_cursor = s_fallback_text;
 }
@@ -304,6 +423,30 @@ bool display_next_token(char *buf, size_t buf_size)
     return len > 0;
 }
 
+void display_save_position(void)
+{
+    long offset;
+
+    if (!s_book_file || s_selected_book_index >= s_book_count) {
+        return;
+    }
+
+    offset = ftell(s_book_file);
+    if (offset < 0) {
+        return;
+    }
+
+    set_saved_offset_for_book(s_book_names[s_selected_book_index], (uint32_t)offset);
+}
+
+const char *display_get_current_book_name(void)
+{
+    if (s_selected_book_index >= s_book_count) {
+        return NULL;
+    }
+    return s_book_names[s_selected_book_index];
+}
+
 size_t display_get_total_bytes(void)
 {
     update_storage_info();
@@ -340,6 +483,7 @@ const char *display_get_book_name(size_t index)
 
 bool display_select_book(size_t index)
 {
+    display_save_position();
     if (!open_book_by_index(index)) {
         s_fallback_cursor = s_fallback_text;
         return false;

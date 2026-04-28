@@ -30,6 +30,7 @@ static uint8_t RGB_Data[192][3] ={
 };
 
 static led_strip_handle_t led_strip;
+static bool s_rgb_enabled = true;
 
 
 void RGB_Init(void)
@@ -50,10 +51,31 @@ void RGB_Init(void)
 }
 void Set_RGB( uint8_t red_val, uint8_t green_val, uint8_t blue_val)
 {
+    if (!s_rgb_enabled) {
+        red_val = 0;
+        green_val = 0;
+        blue_val = 0;
+    }
     /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
     led_strip_set_pixel(led_strip, 0, red_val, green_val, blue_val);
     /* Refresh the strip to send data */
     led_strip_refresh(led_strip);
+}
+
+void RGB_SetEnabled(bool enabled)
+{
+    s_rgb_enabled = enabled;
+    if (!s_rgb_enabled) {
+        led_strip_clear(led_strip);
+        return;
+    }
+
+    Set_RGB(0, 0, 64);
+}
+
+bool RGB_IsEnabled(void)
+{
+    return s_rgb_enabled;
 }
 
 void _RGB_Example(void *arg)

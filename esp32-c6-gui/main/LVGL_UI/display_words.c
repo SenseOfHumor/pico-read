@@ -1,5 +1,7 @@
 #include "display_words.h"
 #include "display.h"
+#include "RGB.h"
+#include "ST7789.h"
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
@@ -78,6 +80,7 @@ typedef enum {
     UI_SCREEN_SPEED,
     UI_SCREEN_BOOKMARKS,
     UI_SCREEN_STORAGE,
+    UI_SCREEN_LED,
     UI_SCREEN_READER,
 } ui_screen_t;
 
@@ -86,6 +89,7 @@ static const char *menu_items[] = {
     "SET READING SPEED",
     "BOOKMARKS",
     "STORAGE",
+    "LED LIGHT",
     "SHUT DOWN",
 };
 
@@ -438,6 +442,9 @@ static void update_reader_status(void)
 static void set_reader_paused(bool paused)
 {
     reader_paused = paused;
+    if (reader_paused) {
+        display_save_position();
+    }
 
     if (reader_timer) {
         if (reader_paused) {
@@ -549,6 +556,17 @@ static void render_storage_menu(lv_obj_t *screen)
     render_list_items(screen, menu_font, items, 2, 0, 32, 4);
 }
 
+static void render_led_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    static const char *items[] = { "ON", "OFF" };
+    size_t selected = RGB_IsEnabled() ? 0 : 1;
+    lv_obj_t *title = create_text(screen, "LED LIGHT", menu_font, MENU_TEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+    render_list_items(screen, menu_font, items, 2, selected, SUBMENU_LIST_Y, 4);
+}
+
 static void render_reader_screen(lv_obj_t *screen)
 {
     const lv_font_t *word_font = get_word_font();
@@ -627,6 +645,9 @@ static void render_current_screen(void)
     case UI_SCREEN_STORAGE:
         render_storage_menu(screen);
         break;
+    case UI_SCREEN_LED:
+        render_led_menu(screen);
+        break;
     case UI_SCREEN_READER:
         render_reader_screen(screen);
         break;
@@ -656,6 +677,10 @@ static void handle_single_press(void)
     case UI_SCREEN_BOOKMARKS:
     case UI_SCREEN_STORAGE:
         break;
+    case UI_SCREEN_LED:
+        RGB_SetEnabled(!RGB_IsEnabled());
+        render_current_screen();
+        break;
     case UI_SCREEN_READER:
         set_reader_paused(!reader_paused);
         break;
@@ -680,6 +705,12 @@ static void handle_long_press(void)
             push_screen(UI_SCREEN_STORAGE);
             break;
         case 4:
+            push_screen(UI_SCREEN_LED);
+            break;
+        case 5:
+            display_save_position();
+            RGB_SetEnabled(false);
+            LCD_EnterSleep();
             esp_deep_sleep_start();
             return;
         default:
@@ -700,6 +731,7 @@ static void handle_long_press(void)
         break;
     case UI_SCREEN_BOOKMARKS:
     case UI_SCREEN_STORAGE:
+    case UI_SCREEN_LED:
     case UI_SCREEN_READER:
         break;
     }
@@ -714,7 +746,11 @@ static void handle_double_click(void)
     case UI_SCREEN_SPEED:
     case UI_SCREEN_BOOKMARKS:
     case UI_SCREEN_STORAGE:
+    case UI_SCREEN_LED:
     case UI_SCREEN_READER:
+        if (current_screen == UI_SCREEN_READER) {
+            display_save_position();
+        }
         pop_screen();
         render_current_screen();
         break;

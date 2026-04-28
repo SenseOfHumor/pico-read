@@ -13,14 +13,16 @@ idf_component_register(
                               "LVGL_Driver/LVGL_Driver.c"
                               "LVGL_UI/display.c"
                               "LVGL_UI/display_words.c"
+                              "RGB/RGB.c"
 
                          INCLUDE_DIRS 
                               "./LCD_Driver/Vernon_ST7789T" 
                               "./LCD_Driver" 
                               "./LVGL_Driver" 
                               "./LVGL_UI" 
+                              "./RGB"
                               "."
-                         REQUIRES esp_lcd spiffs spi_flash
+                         REQUIRES esp_lcd spiffs spi_flash nvs_flash
                        )
 
 spiffs_create_partition_image(flash_test "${DISPLAY_FS_DIR}" FLASH_IN_PROJECT)

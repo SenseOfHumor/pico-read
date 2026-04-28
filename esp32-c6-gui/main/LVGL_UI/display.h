@@ -10,6 +10,8 @@
 bool display_init(void);
 bool display_next_token(char *buf, size_t buf_size);
 void display_reset(void);
+void display_save_position(void);
+const char *display_get_current_book_name(void);
 size_t display_get_total_bytes(void);
 size_t display_get_used_bytes(void);
 size_t display_get_free_bytes(void);
