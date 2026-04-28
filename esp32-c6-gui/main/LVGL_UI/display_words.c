@@ -3,6 +3,7 @@
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
+#include "esp_sleep.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -46,6 +47,11 @@ LV_FONT_DECLARE(lv_font_montserrat_40);
 #define MENU_TEXT_COLOR 0xB8B8B8
 #define MENU_HIGHLIGHT_COLOR 0xD88484
 #define MENU_SUBTEXT_COLOR 0x707070
+#define MENU_LIST_X 18
+#define ROOT_LIST_Y 14
+#define SUBMENU_TITLE_Y 12
+#define SUBMENU_LIST_Y 48
+#define MENU_LINE_STEP 28
 
 #define GUIDE_MARGIN_X 6
 #define GUIDE_TOP_Y 25
@@ -71,17 +77,16 @@ typedef enum {
     UI_SCREEN_BOOKS,
     UI_SCREEN_SPEED,
     UI_SCREEN_BOOKMARKS,
+    UI_SCREEN_STORAGE,
     UI_SCREEN_READER,
 } ui_screen_t;
 
 static const char *menu_items[] = {
-    "Books",
-    "Set reading speed",
-    "Bookmarks",
-};
-
-static const char *book_items[] = {
-    "paragraph.txt",
+    "BOOKS",
+    "SET READING SPEED",
+    "BOOKMARKS",
+    "STORAGE",
+    "SHUT DOWN",
 };
 
 static ui_screen_t current_screen = UI_SCREEN_MENU;
@@ -100,6 +105,7 @@ static lv_obj_t *speed_label;
 
 static lv_timer_t *reader_timer;
 static lv_timer_t *button_timer;
+static bool reader_paused = true;
 
 static char token_buf[DISPLAY_TOKEN_MAX_LEN];
 static size_t max_word_len;
@@ -364,12 +370,85 @@ static lv_obj_t *create_text(lv_obj_t *parent, const char *text, const lv_font_t
     return label;
 }
 
+static void render_list_items(
+    lv_obj_t *screen,
+    const lv_font_t *font,
+    const char *const *items,
+    size_t item_count,
+    size_t selected_index,
+    lv_coord_t start_y,
+    size_t max_visible)
+{
+    size_t visible_count;
+    size_t start_index;
+
+    if (item_count == 0) {
+        return;
+    }
+
+    visible_count = item_count < max_visible ? item_count : max_visible;
+    start_index = 0;
+
+    if (selected_index >= visible_count) {
+        start_index = selected_index - visible_count + 1;
+    }
+    if (start_index + visible_count > item_count) {
+        start_index = item_count - visible_count;
+    }
+
+    for (size_t i = 0; i < visible_count; i++) {
+        size_t item_index = start_index + i;
+        uint32_t color = (item_index == selected_index) ? MENU_HIGHLIGHT_COLOR : MENU_TEXT_COLOR;
+        lv_obj_t *label = create_text(screen, items[item_index], font, color);
+        lv_obj_align(label, LV_ALIGN_TOP_LEFT, MENU_LIST_X, start_y + (lv_coord_t)(i * MENU_LINE_STEP));
+    }
+}
+
+static void format_capacity_text(char *buf, size_t buf_size, size_t bytes)
+{
+    if (bytes >= (1024U * 1024U)) {
+        snprintf(buf, buf_size, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+        return;
+    }
+
+    snprintf(buf, buf_size, "%.0f KB", (double)bytes / 1024.0);
+}
+
 static void stop_reader_timer(void)
 {
     if (reader_timer) {
         lv_timer_del(reader_timer);
         reader_timer = NULL;
     }
+}
+
+static void update_reader_status(void)
+{
+    if (!speed_label) {
+        return;
+    }
+
+    if (reader_paused) {
+        lv_label_set_text_fmt(speed_label, "%u WPM  PAUSED", reading_speed_wpm);
+    } else {
+        lv_label_set_text_fmt(speed_label, "%u WPM", reading_speed_wpm);
+    }
+}
+
+static void set_reader_paused(bool paused)
+{
+    reader_paused = paused;
+
+    if (reader_timer) {
+        if (reader_paused) {
+            lv_timer_pause(reader_timer);
+        } else {
+            lv_timer_resume(reader_timer);
+            lv_timer_set_period(reader_timer, get_base_word_delay_ms());
+        }
+    }
+
+    update_reader_status();
 }
 
 static void reset_reader_objects(void)
@@ -386,62 +465,88 @@ static void reset_reader_objects(void)
 static void render_root_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
-    lv_obj_t *title = create_text(screen, "Menu", menu_font, MENU_HIGHLIGHT_COLOR);
-    lv_coord_t y = 52;
-
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-
-    for (size_t i = 0; i < sizeof(menu_items) / sizeof(menu_items[0]); i++) {
-        uint32_t color = (i == root_menu_index) ? MENU_HIGHLIGHT_COLOR : MENU_TEXT_COLOR;
-        lv_obj_t *label = create_text(screen, menu_items[i], menu_font, color);
-        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, y);
-        y += 36;
-    }
-
-    lv_obj_t *hint = create_text(screen, "Press next  Hold select  Double back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -10);
+    render_list_items(
+        screen,
+        menu_font,
+        menu_items,
+        sizeof(menu_items) / sizeof(menu_items[0]),
+        root_menu_index,
+        ROOT_LIST_Y,
+        5
+    );
 }
 
 static void render_books_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
-    lv_obj_t *title = create_text(screen, "Books", menu_font, MENU_HIGHLIGHT_COLOR);
-    lv_obj_t *book = create_text(screen, book_items[book_menu_index], menu_font, MENU_HIGHLIGHT_COLOR);
-    lv_obj_t *hint = create_text(screen, "Hold to open", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+    lv_obj_t *title = create_text(screen, "BOOKS", menu_font, MENU_TEXT_COLOR);
+    size_t book_count = display_get_book_count();
+    static const char *empty_books[] = { "NO BOOKS" };
+    const char *book_names[DISPLAY_MAX_BOOKS];
 
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-    lv_obj_align(book, LV_ALIGN_CENTER, 0, -6);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+
+    if (book_count == 0) {
+        render_list_items(screen, menu_font, empty_books, 1, 0, SUBMENU_LIST_Y, 4);
+        return;
+    }
+
+    for (size_t i = 0; i < book_count && i < DISPLAY_MAX_BOOKS; i++) {
+        const char *name = display_get_book_name(i);
+        book_names[i] = name ? name : "UNKNOWN";
+    }
+
+    render_list_items(screen, menu_font, book_names, book_count, book_menu_index, SUBMENU_LIST_Y, 4);
 }
 
 static void render_speed_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
-    char speed_text[32];
-    lv_obj_t *title = create_text(screen, "Reading speed", menu_font, MENU_HIGHLIGHT_COLOR);
-    lv_obj_t *subtitle = create_text(screen, "Single press adds 50 WPM", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
-    lv_obj_t *hint = create_text(screen, "Hold to save  Double to go back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
-    lv_obj_t *value;
+    lv_obj_t *title = create_text(screen, "SET READING SPEED", menu_font, MENU_TEXT_COLOR);
+    char speed_rows[4][24];
+    const char *items[4];
 
-    snprintf(speed_text, sizeof(speed_text), "%u WPM", reading_speed_wpm);
-    value = create_text(screen, speed_text, menu_font, MENU_TEXT_COLOR);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
 
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-    lv_obj_align(value, LV_ALIGN_CENTER, 0, -8);
-    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 26);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+    for (size_t i = 0; i < 4; i++) {
+        uint16_t value = (uint16_t)(reading_speed_wpm + (i * WPM_STEP));
+        if (value > WPM_MAX) {
+            value = (uint16_t)(WPM_MIN + ((value - WPM_MIN) % (WPM_MAX - WPM_MIN + WPM_STEP)));
+        }
+        snprintf(speed_rows[i], sizeof(speed_rows[i]), "%u WPM", value);
+        items[i] = speed_rows[i];
+    }
+
+    render_list_items(screen, menu_font, items, 4, 0, SUBMENU_LIST_Y, 4);
 }
 
 static void render_bookmarks_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
-    lv_obj_t *title = create_text(screen, "Bookmarks", menu_font, MENU_HIGHLIGHT_COLOR);
-    lv_obj_t *empty = create_text(screen, "Empty for now", menu_font, MENU_TEXT_COLOR);
-    lv_obj_t *hint = create_text(screen, "Double to go back", &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+    lv_obj_t *title = create_text(screen, "BOOKMARKS", menu_font, MENU_TEXT_COLOR);
+    static const char *items[] = { "EMPTY FOR NOW" };
 
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
-    lv_obj_align(empty, LV_ALIGN_CENTER, 0, -4);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+    render_list_items(screen, menu_font, items, 1, 0, SUBMENU_LIST_Y, 4);
+}
+
+static void render_storage_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    char free_text[32];
+    char total_text[32];
+    char free_line[64];
+    char total_line[64];
+    static const char *items[2];
+
+    format_capacity_text(free_text, sizeof(free_text), display_get_free_bytes());
+    format_capacity_text(total_text, sizeof(total_text), display_get_total_bytes());
+    snprintf(free_line, sizeof(free_line), "STORAGE FREE %s", free_text);
+    snprintf(total_line, sizeof(total_line), "TOTAL %s", total_text);
+    items[0] = free_line;
+    items[1] = total_line;
+
+    render_list_items(screen, menu_font, items, 2, 0, 32, 4);
 }
 
 static void render_reader_screen(lv_obj_t *screen)
@@ -469,7 +574,6 @@ static void render_reader_screen(lv_obj_t *screen)
     lv_obj_align_to(bottom_tick, bottom_guide, LV_ALIGN_OUT_TOP_MID, 0, 0);
 
     speed_label = lv_label_create(screen);
-    lv_label_set_text_fmt(speed_label, "%u WPM", reading_speed_wpm);
     lv_obj_set_style_text_color(speed_label, lv_color_hex(SPEED_COLOR), 0);
     lv_obj_set_style_text_font(speed_label, &lv_font_montserrat_12, 0);
     lv_obj_align(speed_label, LV_ALIGN_BOTTOM_RIGHT, -14, -4);
@@ -494,6 +598,7 @@ static void render_reader_screen(lv_obj_t *screen)
 
     next_word_cb(NULL);
     reader_timer = lv_timer_create(next_word_cb, get_base_word_delay_ms(), NULL);
+    set_reader_paused(true);
 }
 
 static void render_current_screen(void)
@@ -519,6 +624,9 @@ static void render_current_screen(void)
     case UI_SCREEN_BOOKMARKS:
         render_bookmarks_menu(screen);
         break;
+    case UI_SCREEN_STORAGE:
+        render_storage_menu(screen);
+        break;
     case UI_SCREEN_READER:
         render_reader_screen(screen);
         break;
@@ -533,8 +641,10 @@ static void handle_single_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKS:
-        book_menu_index = (book_menu_index + 1) % (sizeof(book_items) / sizeof(book_items[0]));
-        render_current_screen();
+        if (display_get_book_count() > 0) {
+            book_menu_index = (book_menu_index + 1) % display_get_book_count();
+            render_current_screen();
+        }
         break;
     case UI_SCREEN_SPEED:
         reading_speed_wpm += WPM_STEP;
@@ -544,7 +654,10 @@ static void handle_single_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_STORAGE:
+        break;
     case UI_SCREEN_READER:
+        set_reader_paused(!reader_paused);
         break;
     }
 }
@@ -563,6 +676,12 @@ static void handle_long_press(void)
         case 2:
             push_screen(UI_SCREEN_BOOKMARKS);
             break;
+        case 3:
+            push_screen(UI_SCREEN_STORAGE);
+            break;
+        case 4:
+            esp_deep_sleep_start();
+            return;
         default:
             current_screen = UI_SCREEN_MENU;
             break;
@@ -570,14 +689,17 @@ static void handle_long_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKS:
-        push_screen(UI_SCREEN_READER);
-        render_current_screen();
+        if (display_get_book_count() > 0 && display_select_book(book_menu_index)) {
+            push_screen(UI_SCREEN_READER);
+            render_current_screen();
+        }
         break;
     case UI_SCREEN_SPEED:
         pop_screen();
         render_current_screen();
         break;
     case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_STORAGE:
     case UI_SCREEN_READER:
         break;
     }
@@ -591,6 +713,7 @@ static void handle_double_click(void)
     case UI_SCREEN_BOOKS:
     case UI_SCREEN_SPEED:
     case UI_SCREEN_BOOKMARKS:
+    case UI_SCREEN_STORAGE:
     case UI_SCREEN_READER:
         pop_screen();
         render_current_screen();
