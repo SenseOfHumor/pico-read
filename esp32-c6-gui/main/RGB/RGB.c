@@ -1,4 +1,7 @@
 #include "RGB.h"
+#include "esp_err.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 
 static uint8_t RGB_Data[192][3] ={
     {64, 1, 0}, {63, 2, 0}, {62, 3, 0}, {61, 4, 0}, {60, 5, 0}, {59, 6, 0}, {58, 7, 0}, {57, 8, 0},
@@ -31,10 +34,78 @@ static uint8_t RGB_Data[192][3] ={
 
 static led_strip_handle_t led_strip;
 static bool s_rgb_enabled = true;
+static uint8_t s_red = 0;
+static uint8_t s_green = 0;
+static uint8_t s_blue = 64;
+static bool s_nvs_ready = false;
+static nvs_handle_t s_nvs_handle;
+static const char *RGB_NS = "ui";
+static const char *RGB_KEY = "led";
+
+typedef struct {
+    uint8_t enabled;
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+} rgb_state_t;
+
+static void rgb_nvs_init(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err == ESP_ERR_INVALID_STATE) {
+        err = ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return;
+    }
+
+    err = nvs_open(RGB_NS, NVS_READWRITE, &s_nvs_handle);
+    if (err == ESP_OK) {
+        s_nvs_ready = true;
+    }
+}
+
+static void rgb_load_state(void)
+{
+    rgb_state_t state = {
+        .enabled = 1,
+        .red = 0,
+        .green = 0,
+        .blue = 64,
+    };
+    size_t size = sizeof(state);
+
+    if (!s_nvs_ready) {
+        s_rgb_enabled = true;
+        s_red = 0;
+        s_green = 0;
+        s_blue = 64;
+        return;
+    }
+
+    if (nvs_get_blob(s_nvs_handle, RGB_KEY, &state, &size) != ESP_OK || size != sizeof(state)) {
+        s_rgb_enabled = true;
+        s_red = 0;
+        s_green = 0;
+        s_blue = 64;
+        return;
+    }
+
+    s_rgb_enabled = state.enabled != 0;
+    s_red = state.red;
+    s_green = state.green;
+    s_blue = state.blue;
+}
 
 
 void RGB_Init(void)
 {
+    rgb_nvs_init();
+    rgb_load_state();
     /* LED strip initialization with the GPIO and pixels number*/
     led_strip_config_t strip_config = {
         .strip_gpio_num = BLINK_GPIO,
@@ -48,6 +119,7 @@ void RGB_Init(void)
 
     /* Set all LED off to clear all pixels */
     led_strip_clear(led_strip);
+    Set_RGB(s_red, s_green, s_blue);
 }
 void Set_RGB( uint8_t red_val, uint8_t green_val, uint8_t blue_val)
 {
@@ -56,10 +128,31 @@ void Set_RGB( uint8_t red_val, uint8_t green_val, uint8_t blue_val)
         green_val = 0;
         blue_val = 0;
     }
-    /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
-    led_strip_set_pixel(led_strip, 0, red_val, green_val, blue_val);
+    /* The onboard LED is wired in GRB order even though the UI uses RGB names. */
+    led_strip_set_pixel(led_strip, 0, green_val, red_val, blue_val);
     /* Refresh the strip to send data */
     led_strip_refresh(led_strip);
+}
+
+void RGB_SetColor(uint8_t red_val, uint8_t green_val, uint8_t blue_val)
+{
+    s_red = red_val;
+    s_green = green_val;
+    s_blue = blue_val;
+    Set_RGB(s_red, s_green, s_blue);
+}
+
+void RGB_GetColor(uint8_t *red_val, uint8_t *green_val, uint8_t *blue_val)
+{
+    if (red_val) {
+        *red_val = s_red;
+    }
+    if (green_val) {
+        *green_val = s_green;
+    }
+    if (blue_val) {
+        *blue_val = s_blue;
+    }
 }
 
 void RGB_SetEnabled(bool enabled)
@@ -70,12 +163,28 @@ void RGB_SetEnabled(bool enabled)
         return;
     }
 
-    Set_RGB(0, 0, 64);
+    Set_RGB(s_red, s_green, s_blue);
 }
 
 bool RGB_IsEnabled(void)
 {
     return s_rgb_enabled;
+}
+
+void RGB_SaveState(void)
+{
+    rgb_state_t state;
+
+    if (!s_nvs_ready) {
+        return;
+    }
+
+    state.enabled = s_rgb_enabled ? 1 : 0;
+    state.red = s_red;
+    state.green = s_green;
+    state.blue = s_blue;
+    nvs_set_blob(s_nvs_handle, RGB_KEY, &state, sizeof(state));
+    nvs_commit(s_nvs_handle);
 }
 
 void _RGB_Example(void *arg)

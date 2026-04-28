@@ -77,10 +77,14 @@ static uint16_t reading_speed_wpm = DEFAULT_WPM;
 typedef enum {
     UI_SCREEN_MENU = 0,
     UI_SCREEN_BOOKS,
+    UI_SCREEN_BOOK_ACTION,
     UI_SCREEN_SPEED,
     UI_SCREEN_BOOKMARKS,
     UI_SCREEN_STORAGE,
+    UI_SCREEN_BRIGHTNESS,
     UI_SCREEN_LED,
+    UI_SCREEN_JUMP_MENU,
+    UI_SCREEN_JUMP_CUSTOM,
     UI_SCREEN_READER,
 } ui_screen_t;
 
@@ -89,15 +93,90 @@ static const char *menu_items[] = {
     "SET READING SPEED",
     "BOOKMARKS",
     "STORAGE",
+    "SCREEN BRIGHTNESS",
     "LED LIGHT",
     "SHUT DOWN",
 };
 
+static const char *book_action_items[] = {
+    "CONTINUE",
+    "START OVER",
+    "JUMP",
+};
+
+static const char *jump_items[] = {
+    "10%",
+    "25%",
+    "50%",
+    "75%",
+    "90%",
+    "CUSTOM",
+};
+
+static const char *brightness_items[] = {
+    "5%",
+    "10%",
+    "25%",
+    "50%",
+    "75%",
+    "100%",
+};
+
+static const char *led_items[] = {
+    "OFF",
+    "BLUE",
+    "GREEN",
+    "AMBER",
+    "WHITE",
+    "RED",
+    "CYAN",
+    "MAGENTA",
+    "YELLOW",
+    "PURPLE",
+    "MINT",
+    "ORANGE",
+    "PINK",
+    "LIME",
+    "SKY",
+};
+
+typedef struct {
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+} led_color_t;
+
+static const led_color_t led_colors[] = {
+    { 0, 0, 0 },      /* OFF */
+    { 0, 0, 64 },     /* BLUE */
+    { 0, 64, 0 },     /* GREEN */
+    { 64, 48, 0 },    /* AMBER */
+    { 48, 48, 48 },   /* WHITE */
+    { 64, 0, 0 },     /* RED */
+    { 0, 48, 48 },    /* CYAN */
+    { 48, 0, 48 },    /* MAGENTA */
+    { 48, 48, 0 },    /* YELLOW */
+    { 32, 0, 64 },    /* PURPLE */
+    { 0, 64, 32 },    /* MINT */
+    { 64, 24, 0 },    /* ORANGE */
+    { 64, 16, 32 },   /* PINK */
+    { 32, 64, 0 },    /* LIME */
+    { 0, 32, 64 },    /* SKY */
+};
+
 static ui_screen_t current_screen = UI_SCREEN_MENU;
-static ui_screen_t screen_stack[4];
+static ui_screen_t screen_stack[8];
 static uint8_t screen_stack_len;
 static uint8_t root_menu_index;
 static uint8_t book_menu_index;
+static uint8_t bookmark_menu_index;
+static uint8_t book_action_index;
+static uint8_t jump_menu_index;
+static uint8_t jump_digit_tens;
+static uint8_t jump_digit_ones;
+static uint8_t jump_digit_stage;
+static uint8_t brightness_menu_index;
+static uint8_t led_menu_index;
 
 static lv_obj_t *left_label;
 static lv_obj_t *left_bold_label;
@@ -106,9 +185,11 @@ static lv_obj_t *anchor_bold_label;
 static lv_obj_t *right_label;
 static lv_obj_t *right_bold_label;
 static lv_obj_t *speed_label;
+static lv_obj_t *toast_label;
 
 static lv_timer_t *reader_timer;
 static lv_timer_t *button_timer;
+static lv_timer_t *toast_timer;
 static bool reader_paused = true;
 
 static char token_buf[DISPLAY_TOKEN_MAX_LEN];
@@ -374,6 +455,40 @@ static lv_obj_t *create_text(lv_obj_t *parent, const char *text, const lv_font_t
     return label;
 }
 
+static lv_obj_t *create_jump_box(
+    lv_obj_t *parent,
+    const char *text,
+    const lv_font_t *font,
+    bool selected,
+    lv_coord_t x,
+    lv_coord_t y)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_t *label;
+
+    lv_obj_set_size(box, 28, 36);
+    lv_obj_set_style_bg_color(box, lv_color_hex(BG_COLOR), 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_border_color(
+        box,
+        lv_color_hex(selected ? MENU_HIGHLIGHT_COLOR : MENU_SUBTEXT_COLOR),
+        0);
+    lv_obj_set_style_radius(box, 4, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_align(box, LV_ALIGN_TOP_LEFT, x, y);
+
+    label = lv_label_create(box);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(selected ? MENU_HIGHLIGHT_COLOR : MENU_TEXT_COLOR), 0);
+    lv_obj_set_style_bg_opa(label, LV_OPA_TRANSP, 0);
+    lv_obj_center(label);
+    return box;
+}
+
 static void render_list_items(
     lv_obj_t *screen,
     const lv_font_t *font,
@@ -418,12 +533,122 @@ static void format_capacity_text(char *buf, size_t buf_size, size_t bytes)
     snprintf(buf, buf_size, "%.0f KB", (double)bytes / 1024.0);
 }
 
+static uint8_t get_brightness_menu_index(void)
+{
+    uint8_t level = BK_GetLight();
+
+    if (level <= 5) {
+        return 0;
+    }
+    if (level <= 10) {
+        return 1;
+    }
+    if (level <= 25) {
+        return 2;
+    }
+    if (level <= 50) {
+        return 3;
+    }
+    if (level <= 75) {
+        return 4;
+    }
+    return 5;
+}
+
+static uint8_t get_led_menu_index(void)
+{
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+
+    if (!RGB_IsEnabled()) {
+        return 0;
+    }
+
+    RGB_GetColor(&red, &green, &blue);
+    for (size_t i = 1; i < (sizeof(led_colors) / sizeof(led_colors[0])); i++) {
+        if (red == led_colors[i].red &&
+            green == led_colors[i].green &&
+            blue == led_colors[i].blue) {
+            return (uint8_t)i;
+        }
+    }
+    return 1;
+}
+
+static void apply_led_menu_selection(uint8_t selection)
+{
+    if (selection >= (sizeof(led_colors) / sizeof(led_colors[0]))) {
+        return;
+    }
+
+    if (selection == 0) {
+        RGB_SetEnabled(false);
+        return;
+    }
+
+    RGB_SetColor(
+        led_colors[selection].red,
+        led_colors[selection].green,
+        led_colors[selection].blue);
+    RGB_SetEnabled(true);
+}
+
 static void stop_reader_timer(void)
 {
     if (reader_timer) {
         lv_timer_del(reader_timer);
         reader_timer = NULL;
     }
+}
+
+static void toast_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (toast_label) {
+        lv_obj_del(toast_label);
+        toast_label = NULL;
+    }
+    if (toast_timer) {
+        lv_timer_del(toast_timer);
+        toast_timer = NULL;
+    }
+}
+
+static void show_toast(const char *message)
+{
+    lv_obj_t *screen;
+
+    if (current_screen != UI_SCREEN_READER) {
+        return;
+    }
+
+    screen = lv_scr_act();
+    if (toast_label) {
+        lv_obj_del(toast_label);
+        toast_label = NULL;
+    }
+    if (toast_timer) {
+        lv_timer_del(toast_timer);
+        toast_timer = NULL;
+    }
+
+    toast_label = lv_label_create(screen);
+    lv_label_set_text(toast_label, message);
+    lv_obj_set_style_text_font(toast_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(toast_label, lv_color_hex(MENU_TEXT_COLOR), 0);
+    lv_obj_set_style_bg_color(toast_label, lv_color_hex(0x101010), 0);
+    lv_obj_set_style_bg_opa(toast_label, LV_OPA_80, 0);
+    lv_obj_set_style_pad_left(toast_label, 10, 0);
+    lv_obj_set_style_pad_right(toast_label, 10, 0);
+    lv_obj_set_style_pad_top(toast_label, 6, 0);
+    lv_obj_set_style_pad_bottom(toast_label, 6, 0);
+    lv_obj_set_style_radius(toast_label, 8, 0);
+    lv_obj_align(toast_label, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    toast_timer = lv_timer_create(toast_timer_cb, 900, NULL);
+    lv_timer_set_repeat_count(toast_timer, 1);
 }
 
 static void update_reader_status(void)
@@ -467,6 +692,7 @@ static void reset_reader_objects(void)
     right_label = NULL;
     right_bold_label = NULL;
     speed_label = NULL;
+    toast_label = NULL;
 }
 
 static void render_root_menu(lv_obj_t *screen)
@@ -506,6 +732,36 @@ static void render_books_menu(lv_obj_t *screen)
     render_list_items(screen, menu_font, book_names, book_count, book_menu_index, SUBMENU_LIST_Y, 4);
 }
 
+static void render_book_action_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    const char *book_name = display_get_book_name(book_menu_index);
+    char status_line[48];
+    lv_obj_t *title;
+    lv_obj_t *status;
+
+    if (!book_name) {
+        book_name = "UNKNOWN";
+    }
+
+    snprintf(status_line, sizeof(status_line), "LAST POSITION: %u%%", display_get_book_progress_percent(book_menu_index));
+
+    title = create_text(screen, book_name, &lv_font_montserrat_12, MENU_TEXT_COLOR);
+    status = create_text(screen, status_line, &lv_font_montserrat_12, MENU_SUBTEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, 8);
+    lv_obj_align(status, LV_ALIGN_TOP_LEFT, MENU_LIST_X, 26);
+    render_list_items(
+        screen,
+        menu_font,
+        book_action_items,
+        sizeof(book_action_items) / sizeof(book_action_items[0]),
+        book_action_index,
+        62,
+        4
+    );
+}
+
 static void render_speed_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
@@ -531,10 +787,30 @@ static void render_bookmarks_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
     lv_obj_t *title = create_text(screen, "BOOKMARKS", menu_font, MENU_TEXT_COLOR);
-    static const char *items[] = { "EMPTY FOR NOW" };
+    size_t bookmark_count = display_get_bookmark_count();
+    static const char *empty_items[] = { "NO BOOKMARKS" };
+    static char bookmark_rows[DISPLAY_MAX_BOOKS][DISPLAY_BOOK_NAME_MAX + 8];
+    const char *items[DISPLAY_MAX_BOOKS];
 
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
-    render_list_items(screen, menu_font, items, 1, 0, SUBMENU_LIST_Y, 4);
+
+    if (bookmark_count == 0) {
+        render_list_items(screen, menu_font, empty_items, 1, 0, SUBMENU_LIST_Y, 4);
+        return;
+    }
+
+    if (bookmark_menu_index >= bookmark_count) {
+        bookmark_menu_index = 0;
+    }
+
+    for (size_t i = 0; i < bookmark_count; i++) {
+        const char *name = display_get_bookmark_name(i);
+        uint8_t percent = display_get_bookmark_progress_percent(i);
+        snprintf(bookmark_rows[i], sizeof(bookmark_rows[i]), "%s %u%%", name ? name : "UNKNOWN", percent);
+        items[i] = bookmark_rows[i];
+    }
+
+    render_list_items(screen, menu_font, items, bookmark_count, bookmark_menu_index, SUBMENU_LIST_Y, 4);
 }
 
 static void render_storage_menu(lv_obj_t *screen)
@@ -556,15 +832,76 @@ static void render_storage_menu(lv_obj_t *screen)
     render_list_items(screen, menu_font, items, 2, 0, 32, 4);
 }
 
+static void render_brightness_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    lv_obj_t *title = create_text(screen, "SCREEN BRIGHTNESS", menu_font, MENU_TEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+    render_list_items(
+        screen,
+        menu_font,
+        brightness_items,
+        sizeof(brightness_items) / sizeof(brightness_items[0]),
+        brightness_menu_index,
+        SUBMENU_LIST_Y,
+        4
+    );
+}
+
 static void render_led_menu(lv_obj_t *screen)
 {
     const lv_font_t *menu_font = get_menu_font();
-    static const char *items[] = { "ON", "OFF" };
-    size_t selected = RGB_IsEnabled() ? 0 : 1;
     lv_obj_t *title = create_text(screen, "LED LIGHT", menu_font, MENU_TEXT_COLOR);
 
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
-    render_list_items(screen, menu_font, items, 2, selected, SUBMENU_LIST_Y, 4);
+    render_list_items(
+        screen,
+        menu_font,
+        led_items,
+        sizeof(led_items) / sizeof(led_items[0]),
+        led_menu_index,
+        SUBMENU_LIST_Y,
+        4
+    );
+}
+
+static void render_jump_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    lv_obj_t *title = create_text(screen, "JUMP TO", menu_font, MENU_TEXT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+    render_list_items(
+        screen,
+        menu_font,
+        jump_items,
+        sizeof(jump_items) / sizeof(jump_items[0]),
+        jump_menu_index,
+        SUBMENU_LIST_Y,
+        4
+    );
+}
+
+static void render_jump_custom_menu(lv_obj_t *screen)
+{
+    const lv_font_t *menu_font = get_menu_font();
+    char tens_text[2] = { (char)('0' + jump_digit_tens), '\0' };
+    char ones_text[2] = { (char)('0' + jump_digit_ones), '\0' };
+    lv_obj_t *title = create_text(screen, "CUSTOM JUMP", menu_font, MENU_TEXT_COLOR);
+    lv_obj_t *percent = create_text(screen, "%", menu_font, MENU_TEXT_COLOR);
+    lv_obj_t *confirm = create_text(
+        screen,
+        "CONFIRM",
+        menu_font,
+        jump_digit_stage == 2 ? MENU_HIGHLIGHT_COLOR : MENU_TEXT_COLOR
+    );
+
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, MENU_LIST_X, SUBMENU_TITLE_Y);
+    create_jump_box(screen, tens_text, menu_font, jump_digit_stage == 0, MENU_LIST_X, 68);
+    create_jump_box(screen, ones_text, menu_font, jump_digit_stage == 1, MENU_LIST_X + 40, 68);
+    lv_obj_align(percent, LV_ALIGN_TOP_LEFT, MENU_LIST_X + 78, 72);
+    lv_obj_align(confirm, LV_ALIGN_TOP_LEFT, MENU_LIST_X, 128);
 }
 
 static void render_reader_screen(lv_obj_t *screen)
@@ -626,6 +963,10 @@ static void render_current_screen(void)
     stop_reader_timer();
     reset_reader_objects();
     lv_obj_clean(screen);
+    if (toast_timer) {
+        lv_timer_del(toast_timer);
+        toast_timer = NULL;
+    }
     lv_obj_set_style_bg_color(screen, lv_color_hex(BG_COLOR), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
@@ -636,6 +977,9 @@ static void render_current_screen(void)
     case UI_SCREEN_BOOKS:
         render_books_menu(screen);
         break;
+    case UI_SCREEN_BOOK_ACTION:
+        render_book_action_menu(screen);
+        break;
     case UI_SCREEN_SPEED:
         render_speed_menu(screen);
         break;
@@ -645,8 +989,17 @@ static void render_current_screen(void)
     case UI_SCREEN_STORAGE:
         render_storage_menu(screen);
         break;
+    case UI_SCREEN_BRIGHTNESS:
+        render_brightness_menu(screen);
+        break;
     case UI_SCREEN_LED:
         render_led_menu(screen);
+        break;
+    case UI_SCREEN_JUMP_MENU:
+        render_jump_menu(screen);
+        break;
+    case UI_SCREEN_JUMP_CUSTOM:
+        render_jump_custom_menu(screen);
         break;
     case UI_SCREEN_READER:
         render_reader_screen(screen);
@@ -667,6 +1020,10 @@ static void handle_single_press(void)
             render_current_screen();
         }
         break;
+    case UI_SCREEN_BOOK_ACTION:
+        book_action_index = (book_action_index + 1) % (sizeof(book_action_items) / sizeof(book_action_items[0]));
+        render_current_screen();
+        break;
     case UI_SCREEN_SPEED:
         reading_speed_wpm += WPM_STEP;
         if (reading_speed_wpm > WPM_MAX) {
@@ -675,11 +1032,40 @@ static void handle_single_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKMARKS:
+        if (display_get_bookmark_count() > 0) {
+            bookmark_menu_index = (bookmark_menu_index + 1) % display_get_bookmark_count();
+            render_current_screen();
+        }
+        break;
     case UI_SCREEN_STORAGE:
         break;
-    case UI_SCREEN_LED:
-        RGB_SetEnabled(!RGB_IsEnabled());
+    case UI_SCREEN_BRIGHTNESS:
+        brightness_menu_index = (brightness_menu_index + 1) % (sizeof(brightness_items) / sizeof(brightness_items[0]));
+        {
+            static const uint8_t brightness_values[] = { 5, 10, 25, 50, 75, 100 };
+            BK_Enable(true);
+            BK_Light(brightness_values[brightness_menu_index]);
+        }
         render_current_screen();
+        break;
+    case UI_SCREEN_LED:
+        led_menu_index = (led_menu_index + 1) % (sizeof(led_items) / sizeof(led_items[0]));
+        apply_led_menu_selection(led_menu_index);
+        RGB_SaveState();
+        render_current_screen();
+        break;
+    case UI_SCREEN_JUMP_MENU:
+        jump_menu_index = (jump_menu_index + 1) % (sizeof(jump_items) / sizeof(jump_items[0]));
+        render_current_screen();
+        break;
+    case UI_SCREEN_JUMP_CUSTOM:
+        if (jump_digit_stage == 0) {
+            jump_digit_tens = (uint8_t)((jump_digit_tens + 1) % 10);
+            render_current_screen();
+        } else if (jump_digit_stage == 1) {
+            jump_digit_ones = (uint8_t)((jump_digit_ones + 1) % 10);
+            render_current_screen();
+        }
         break;
     case UI_SCREEN_READER:
         set_reader_paused(!reader_paused);
@@ -705,10 +1091,16 @@ static void handle_long_press(void)
             push_screen(UI_SCREEN_STORAGE);
             break;
         case 4:
-            push_screen(UI_SCREEN_LED);
+            brightness_menu_index = get_brightness_menu_index();
+            push_screen(UI_SCREEN_BRIGHTNESS);
             break;
         case 5:
+            led_menu_index = get_led_menu_index();
+            push_screen(UI_SCREEN_LED);
+            break;
+        case 6:
             display_save_position();
+            RGB_SaveState();
             RGB_SetEnabled(false);
             LCD_EnterSleep();
             esp_deep_sleep_start();
@@ -720,8 +1112,26 @@ static void handle_long_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKS:
-        if (display_get_book_count() > 0 && display_select_book(book_menu_index)) {
-            push_screen(UI_SCREEN_READER);
+        if (display_get_book_count() > 0) {
+            book_action_index = 0;
+            push_screen(UI_SCREEN_BOOK_ACTION);
+            render_current_screen();
+        }
+        break;
+    case UI_SCREEN_BOOK_ACTION:
+        if (book_action_index == 0) {
+            if (display_select_book(book_menu_index)) {
+                push_screen(UI_SCREEN_READER);
+                render_current_screen();
+            }
+        } else if (book_action_index == 1) {
+            if (display_select_book_from_start(book_menu_index)) {
+                push_screen(UI_SCREEN_READER);
+                render_current_screen();
+            }
+        } else if (book_action_index == 2) {
+            jump_menu_index = 0;
+            push_screen(UI_SCREEN_JUMP_MENU);
             render_current_screen();
         }
         break;
@@ -730,9 +1140,47 @@ static void handle_long_press(void)
         render_current_screen();
         break;
     case UI_SCREEN_BOOKMARKS:
+        if (display_get_bookmark_count() > 0 && display_select_bookmark(bookmark_menu_index)) {
+            push_screen(UI_SCREEN_READER);
+            render_current_screen();
+        }
+        break;
     case UI_SCREEN_STORAGE:
-    case UI_SCREEN_LED:
+        break;
     case UI_SCREEN_READER:
+        if (reader_paused && display_save_bookmark_for_current_book()) {
+            show_toast("BOOKMARK SAVED");
+        }
+        break;
+    case UI_SCREEN_BRIGHTNESS:
+    case UI_SCREEN_LED:
+        break;
+    case UI_SCREEN_JUMP_CUSTOM:
+        if (jump_digit_stage < 2) {
+            jump_digit_stage++;
+            render_current_screen();
+        } else {
+            uint8_t percent = (uint8_t)((jump_digit_tens * 10) + jump_digit_ones);
+            if (display_select_book_at_percent(book_menu_index, percent)) {
+                push_screen(UI_SCREEN_READER);
+                render_current_screen();
+            }
+        }
+        break;
+    case UI_SCREEN_JUMP_MENU:
+        if (jump_menu_index < 5) {
+            static const uint8_t jump_percents[] = { 10, 25, 50, 75, 90 };
+            if (display_select_book_at_percent(book_menu_index, jump_percents[jump_menu_index])) {
+                push_screen(UI_SCREEN_READER);
+                render_current_screen();
+            }
+        } else {
+            jump_digit_tens = 0;
+            jump_digit_ones = 0;
+            jump_digit_stage = 0;
+            push_screen(UI_SCREEN_JUMP_CUSTOM);
+            render_current_screen();
+        }
         break;
     }
 }
@@ -746,7 +1194,11 @@ static void handle_double_click(void)
     case UI_SCREEN_SPEED:
     case UI_SCREEN_BOOKMARKS:
     case UI_SCREEN_STORAGE:
+    case UI_SCREEN_BRIGHTNESS:
     case UI_SCREEN_LED:
+    case UI_SCREEN_BOOK_ACTION:
+    case UI_SCREEN_JUMP_MENU:
+    case UI_SCREEN_JUMP_CUSTOM:
     case UI_SCREEN_READER:
         if (current_screen == UI_SCREEN_READER) {
             display_save_position();
@@ -829,5 +1281,13 @@ void display_words_start(void)
     screen_stack_len = 0;
     root_menu_index = 0;
     book_menu_index = 0;
+    bookmark_menu_index = 0;
+    book_action_index = 0;
+    jump_menu_index = 0;
+    jump_digit_tens = 0;
+    jump_digit_ones = 0;
+    jump_digit_stage = 0;
+    brightness_menu_index = get_brightness_menu_index();
+    led_menu_index = get_led_menu_index();
     render_current_screen();
 }

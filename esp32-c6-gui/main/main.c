@@ -14,7 +14,6 @@ void app_main(void)
     LCD_Init();
     BK_Light(80);
     RGB_Init();
-    RGB_SetEnabled(true);
     display_init();
     LVGL_Init();
 
