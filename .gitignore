@@ -1,0 +1,47 @@
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# ESP-IDF / CMake build output
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+sdkconfig.old
+flasher_args.json
+flash_args
+partition_table/
+managed_components/
+
+# Logs and generated binaries
+*.log
+*.bin
+*.elf
+*.map
+*.uf2
+
+# Local archives / temp files
+*.zip
+*.tar
+*.tar.gz
+*.tmp
+
+# Large local reference material / vendored backups
+waveshare-demo/
+waveshare-demo.zip
+esp32-c6-gui/components/
+esp32-c6-gui/components.localbak/
