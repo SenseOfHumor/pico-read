@@ -75,7 +75,8 @@ static uint8_t guide_opacity_percent = 50;
 static uint16_t reading_speed_wpm = DEFAULT_WPM;
 
 typedef enum {
-    UI_SCREEN_MENU = 0,
+    UI_SCREEN_SPLASH = 0,
+    UI_SCREEN_MENU,
     UI_SCREEN_BOOKS,
     UI_SCREEN_BOOK_ACTION,
     UI_SCREEN_SPEED,
@@ -164,7 +165,7 @@ static const led_color_t led_colors[] = {
     { 0, 32, 64 },    /* SKY */
 };
 
-static ui_screen_t current_screen = UI_SCREEN_MENU;
+static ui_screen_t current_screen = UI_SCREEN_SPLASH;
 static ui_screen_t screen_stack[8];
 static uint8_t screen_stack_len;
 static uint8_t root_menu_index;
@@ -190,6 +191,7 @@ static lv_obj_t *toast_label;
 static lv_timer_t *reader_timer;
 static lv_timer_t *button_timer;
 static lv_timer_t *toast_timer;
+static lv_timer_t *splash_timer;
 static bool reader_paused = true;
 
 static char token_buf[DISPLAY_TOKEN_MAX_LEN];
@@ -904,6 +906,8 @@ static void render_jump_custom_menu(lv_obj_t *screen)
     lv_obj_align(confirm, LV_ALIGN_TOP_LEFT, MENU_LIST_X, 128);
 }
 
+static void render_current_screen(void);
+
 static void render_reader_screen(lv_obj_t *screen)
 {
     const lv_font_t *word_font = get_word_font();
@@ -956,6 +960,33 @@ static void render_reader_screen(lv_obj_t *screen)
     set_reader_paused(true);
 }
 
+static void splash_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    if (splash_timer) {
+        lv_timer_del(splash_timer);
+        splash_timer = NULL;
+    }
+
+    current_screen = UI_SCREEN_MENU;
+    render_current_screen();
+}
+
+static void render_splash_screen(lv_obj_t *screen)
+{
+    lv_obj_t *title = create_text(screen, "PICO", &lv_font_montserrat_40, MENU_TEXT_COLOR);
+    lv_obj_t *subtitle = create_text(screen, "pico read", &lv_font_montserrat_12, MENU_HIGHLIGHT_COLOR);
+
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_align(subtitle, LV_ALIGN_BOTTOM_MID, 0, -14);
+
+    if (!splash_timer) {
+        splash_timer = lv_timer_create(splash_timer_cb, 1400, NULL);
+        lv_timer_set_repeat_count(splash_timer, 1);
+    }
+}
+
 static void render_current_screen(void)
 {
     lv_obj_t *screen = lv_scr_act();
@@ -967,10 +998,17 @@ static void render_current_screen(void)
         lv_timer_del(toast_timer);
         toast_timer = NULL;
     }
+    if (current_screen != UI_SCREEN_SPLASH && splash_timer) {
+        lv_timer_del(splash_timer);
+        splash_timer = NULL;
+    }
     lv_obj_set_style_bg_color(screen, lv_color_hex(BG_COLOR), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
 
     switch (current_screen) {
+    case UI_SCREEN_SPLASH:
+        render_splash_screen(screen);
+        break;
     case UI_SCREEN_MENU:
         render_root_menu(screen);
         break;
@@ -1010,6 +1048,8 @@ static void render_current_screen(void)
 static void handle_single_press(void)
 {
     switch (current_screen) {
+    case UI_SCREEN_SPLASH:
+        break;
     case UI_SCREEN_MENU:
         root_menu_index = (root_menu_index + 1) % (sizeof(menu_items) / sizeof(menu_items[0]));
         render_current_screen();
@@ -1076,6 +1116,8 @@ static void handle_single_press(void)
 static void handle_long_press(void)
 {
     switch (current_screen) {
+    case UI_SCREEN_SPLASH:
+        break;
     case UI_SCREEN_MENU:
         switch (root_menu_index) {
         case 0:
@@ -1188,6 +1230,8 @@ static void handle_long_press(void)
 static void handle_double_click(void)
 {
     switch (current_screen) {
+    case UI_SCREEN_SPLASH:
+        break;
     case UI_SCREEN_MENU:
         break;
     case UI_SCREEN_BOOKS:
@@ -1277,7 +1321,7 @@ void display_words_start(void)
         button_timer = lv_timer_create(button_poll_cb, BUTTON_POLL_MS, NULL);
     }
 
-    current_screen = UI_SCREEN_MENU;
+    current_screen = UI_SCREEN_SPLASH;
     screen_stack_len = 0;
     root_menu_index = 0;
     book_menu_index = 0;
