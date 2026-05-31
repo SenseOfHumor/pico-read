@@ -3,6 +3,8 @@
 static const char *TAG_LCD = "WS_LCD";
 
 esp_lcd_panel_handle_t panel_handle = NULL;
+static bool s_backlight_enabled = true;
+static uint8_t s_backlight_level = 75;
 
 void LCD_Init(void)
 {
@@ -92,10 +94,39 @@ void BK_Init(void)
 void BK_Light(uint8_t Light)
 {   
     if(Light > 100) Light = 100;
+    s_backlight_level = Light;
     uint16_t Duty = LEDC_MAX_Duty-(81*(100-Light));
-    if(Light == 0) Duty = 0;
+    if(Light == 0 || !s_backlight_enabled) Duty = 0;
     // 设置PWM占空比
     ledc_set_duty(ledc_channel.speed_mode, ledc_channel.channel, Duty);
     ledc_update_duty(ledc_channel.speed_mode, ledc_channel.channel);
+}
+
+void BK_Enable(bool enabled)
+{
+    s_backlight_enabled = enabled;
+    BK_Light(s_backlight_level);
+}
+
+bool BK_IsEnabled(void)
+{
+    return s_backlight_enabled;
+}
+
+uint8_t BK_GetLight(void)
+{
+    return s_backlight_level;
+}
+
+void LCD_EnterSleep(void)
+{
+    BK_Enable(false);
+    ledc_stop(ledc_channel.speed_mode, ledc_channel.channel, EXAMPLE_LCD_BK_LIGHT_OFF_LEVEL);
+    gpio_set_direction(EXAMPLE_PIN_NUM_BK_LIGHT, GPIO_MODE_OUTPUT);
+    gpio_set_level(EXAMPLE_PIN_NUM_BK_LIGHT, EXAMPLE_LCD_BK_LIGHT_OFF_LEVEL);
+    gpio_hold_en(EXAMPLE_PIN_NUM_BK_LIGHT);
+    if (panel_handle) {
+        esp_lcd_panel_disp_on_off(panel_handle, false);
+    }
 }
 // end Backlight program

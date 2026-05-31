@@ -1,6 +1,6 @@
 # pico-read
 
-`pico-read` is an ESP32-C6 speed-reading device built with ESP-IDF and LVGL. The current firmware reads `paragraph.txt` from the ESP filesystem at runtime and renders the text with a fixed anchor-letter reading UI.
+`pico-read` is an ESP32-C6 speed-reading device built with ESP-IDF and LVGL. The firmware reads `.txt` books from the ESP filesystem at runtime and renders them with a fixed anchor-letter reading UI.
 
 ## Warning
 
@@ -11,7 +11,7 @@ This project is currently supported on `macOS` and `Linux` only.
 ## Repository Layout
 
 - `esp32-c6-gui/`: ESP-IDF firmware project
-- `paragraph.txt`: source text file packaged into the device filesystem image
+- `books/`: source `.txt` books packaged into the device filesystem image
 
 ## Dependency Model
 
@@ -56,23 +56,61 @@ On the first build, ESP-IDF will fetch managed dependencies such as `lvgl/lvgl` 
 
 ## Flash
 
-Replace the serial port with your board's actual device path:
+Do not use `/dev/cu.usbmodem1101` blindly. That is only an example.
+
+Find the real port first:
+
+```bash
+ls /dev/cu.*
+```
+
+Then unplug the board, run it again, plug the board back in, and run it again. The new device is the board you should flash. On macOS it is usually something like:
+
+- `/dev/cu.usbmodem...`
+- `/dev/cu.SLAB_USBtoUART`
+
+Flash with the actual port:
 
 ```bash
 cd esp32-c6-gui
-idf.py -p /dev/cu.usbmodem1101 flash
+idf.py -p /dev/cu.usbmodemACTUALPORT flash
 ```
 
-## Updating the Book Text
-
-Edit the root-level `paragraph.txt`, then rebuild and reflash:
+If you want serial logs immediately after flashing:
 
 ```bash
 cd esp32-c6-gui
-idf.py build flash -p /dev/cu.usbmodem1101
+idf.py -p /dev/cu.usbmodemACTUALPORT flash monitor
 ```
 
-The firmware packages `paragraph.txt` into a SPIFFS image during build and streams the text from the device filesystem at runtime.
+If flashing fails with:
+
+- `Could not open /dev/cu....`
+- `the port is busy or doesn't exist`
+
+check these first:
+
+1. The port name is real and matches the current plugged-in board.
+2. No other serial monitor, terminal, or IDE is already using that port.
+3. The board is still connected after the last reset.
+
+If the board does not enter download mode automatically:
+
+1. Hold `BOOT`.
+2. Tap `RESET`.
+3. Release `BOOT`.
+4. Run the flash command again.
+
+## Updating Books
+
+Add or edit `.txt` files inside `books/`, then rebuild and reflash:
+
+```bash
+cd esp32-c6-gui
+idf.py build flash -p /dev/cu.usbmodemACTUALPORT
+```
+
+The firmware packages the `books/` folder into a SPIFFS image during build and streams the selected book from the device filesystem at runtime.
 
 ## Notes
 

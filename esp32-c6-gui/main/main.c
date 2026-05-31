@@ -7,16 +7,21 @@
 #include "ST7789.h"
 #include "display.h"
 #include "display_words.h"
+#include "RGB.h"
 
 void app_main(void)
 {
     LCD_Init();
-    BK_Light(80);
+    BK_Enable(false);
+    RGB_Init();
     display_init();
     LVGL_Init();
 
 /********************* Demo *********************/
     display_words_start();
+    lv_timer_handler();
+    BK_Enable(true);
+    BK_Light(80);
 
     // lv_demo_widgets();
     // lv_demo_keypad_encoder();
