@@ -512,10 +512,13 @@ static size_t normalize_utf8_symbol(FILE *file, int first_byte, char *buf, size_
     return len;
 }
 
+#define DISPLAY_PARAGRAPH_BREAK_TOKEN "\x1E"
+
 bool display_next_token(char *buf, size_t buf_size)
 {
     int ch;
     size_t len = 0;
+    size_t newline_count = 0;
 
     if (!buf || buf_size < 2) {
         return false;
@@ -528,20 +531,28 @@ bool display_next_token(char *buf, size_t buf_size)
     for (;;) {
         ch = fgetc(s_book_file);
         if (ch == EOF) {
-            clearerr(s_book_file);
-            rewind(s_book_file);
             if (len > 0) {
                 break;
             }
-            continue;
+            return false;
         }
 
         if (isspace((unsigned char)ch)) {
             if (len > 0) {
                 break;
             }
+            if (ch == '\n' || ch == '\r' || ch == '\f') {
+                newline_count++;
+                if (newline_count >= 2 && buf_size > 2) {
+                    buf[0] = DISPLAY_PARAGRAPH_BREAK_TOKEN[0];
+                    buf[1] = '\0';
+                    return true;
+                }
+            }
             continue;
         }
+
+        newline_count = 0;
 
         if ((unsigned char)ch >= 0x80) {
             len = normalize_utf8_symbol(s_book_file, ch, buf, buf_size, len);

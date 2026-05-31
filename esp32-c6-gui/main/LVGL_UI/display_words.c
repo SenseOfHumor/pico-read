@@ -28,7 +28,7 @@ LV_FONT_DECLARE(lv_font_montserrat_32);
 LV_FONT_DECLARE(lv_font_montserrat_40);
 #endif
 
-#define DEFAULT_WPM 300
+#define DEFAULT_WPM 400
 #define WPM_STEP 50
 #define WPM_MIN 50
 #define WPM_MAX 1000
@@ -65,14 +65,22 @@ LV_FONT_DECLARE(lv_font_montserrat_40);
 
 /* Adjust this manually to tune the reader text size. Supported values: 16, 24, 28, 32, 40 */
 static uint16_t word_font_size = 32;
-/* Adjust this manually to add a pause after punctuation. Units: milliseconds */
-static uint16_t punctuation_pause_ms = 500;
 /* Adjust this manually to tune word opacity. Range: 0..100 percent */
 static uint8_t word_opacity_percent = 100;
 /* Adjust this manually to tune guideline opacity. Range: 0..100 percent */
 static uint8_t guide_opacity_percent = 50;
 /* Adjust this manually to set the default reading speed. Units: words per minute */
 static uint16_t reading_speed_wpm = DEFAULT_WPM;
+/* Adjust this manually to auto-sleep the device after inactivity. Units: milliseconds */
+static uint32_t inactivity_sleep_ms = 60000;
+/* Delay tuning. Multipliers are stored as tenths to keep them easy to tweak in C. */
+static uint8_t sentence_end_multiplier_x10 = 50;   /* . ! ? => 2.5x */
+static uint8_t major_pause_multiplier_x10 = 50;    /* ; :   => 2.0x */
+static uint8_t minor_pause_multiplier_x10 = 25;    /* ,     => 1.5x */
+static uint8_t paragraph_break_multiplier_x10 = 40;/* break => 4.0x */
+static uint8_t long_word_multiplier_x10 = 40;      /* 9+ chars => 1.2x */
+static uint8_t long_word_min_chars = 10;
+static uint16_t sentence_blank_delay_ms = 80;
 
 typedef enum {
     UI_SCREEN_SPLASH = 0,
@@ -203,6 +211,8 @@ static char anchor_buf[2];
 static lv_coord_t word_max_width;
 static size_t pending_token_len;
 static size_t pending_token_offset;
+static size_t current_token_visible_len;
+static uint32_t pending_blank_delay_ms;
 
 static bool button_raw_pressed;
 static bool button_stable_pressed;
@@ -211,6 +221,7 @@ static uint8_t pending_clicks;
 static uint32_t button_change_tick;
 static uint32_t button_press_tick;
 static uint32_t last_click_tick;
+static uint32_t last_activity_tick;
 
 static lv_opa_t opacity_percent_to_lv(uint8_t percent)
 {
@@ -226,24 +237,81 @@ static uint32_t get_base_word_delay_ms(void)
     return 60000U / wpm;
 }
 
-static uint32_t get_word_delay_ms(const char *word)
+static size_t get_visible_word_len(const char *word)
+{
+    size_t visible_len = 0;
+
+    if (!word) {
+        return 0;
+    }
+
+    for (size_t i = 0; word[i] != '\0'; i++) {
+        if (isalnum((unsigned char)word[i])) {
+            visible_len++;
+        }
+    }
+
+    return visible_len;
+}
+
+static bool is_paragraph_break_token(const char *word)
+{
+    return word && word[0] == '\x1E' && word[1] == '\0';
+}
+
+static uint32_t apply_multiplier_x10(uint32_t base_delay, uint8_t multiplier_x10)
+{
+    return (base_delay * multiplier_x10) / 10U;
+}
+
+static uint32_t get_word_delay_ms(const char *word, uint32_t *blank_delay_ms)
 {
     size_t len = strlen(word);
+    uint32_t base_delay = get_base_word_delay_ms();
+    uint32_t delay = base_delay;
+    size_t visible_len = current_token_visible_len ? current_token_visible_len : get_visible_word_len(word);
+
+    if (blank_delay_ms) {
+        *blank_delay_ms = 0;
+    }
     if (len == 0) {
-        return get_base_word_delay_ms();
+        return base_delay;
+    }
+
+    if (is_paragraph_break_token(word)) {
+        return apply_multiplier_x10(base_delay, paragraph_break_multiplier_x10);
     }
 
     for (size_t i = len; i > 0; i--) {
         char ch = word[i - 1];
-        if (ch == '.' || ch == ',' || ch == ';' || ch == ':' || ch == '!' || ch == '?') {
-            return get_base_word_delay_ms() + punctuation_pause_ms;
+        if (ch == '.' || ch == '!' || ch == '?') {
+            delay = apply_multiplier_x10(base_delay, sentence_end_multiplier_x10);
+            if (blank_delay_ms) {
+                *blank_delay_ms = sentence_blank_delay_ms;
+            }
+            break;
+        }
+        if (ch == ';' || ch == ':') {
+            delay = apply_multiplier_x10(base_delay, major_pause_multiplier_x10);
+            break;
+        }
+        if (ch == ',') {
+            delay = apply_multiplier_x10(base_delay, minor_pause_multiplier_x10);
+            break;
         }
         if (isalnum((unsigned char)ch)) {
             break;
         }
     }
 
-    return get_base_word_delay_ms();
+    if (visible_len >= long_word_min_chars) {
+        uint32_t long_word_delay = apply_multiplier_x10(base_delay, long_word_multiplier_x10);
+        if (delay < long_word_delay) {
+            delay = long_word_delay;
+        }
+    }
+
+    return delay;
 }
 
 static const lv_font_t *get_word_font(void)
@@ -337,6 +405,7 @@ static bool next_chunk(char **chunk_start, size_t *chunk_len)
 
     pending_token_len = strlen(token_buf);
     pending_token_offset = 0;
+    current_token_visible_len = get_visible_word_len(token_buf);
     return next_chunk(chunk_start, chunk_len);
 }
 
@@ -344,6 +413,8 @@ static void prepare_reader_buffers(void)
 {
     pending_token_len = 0;
     pending_token_offset = 0;
+    current_token_visible_len = 0;
+    pending_blank_delay_ms = 0;
 
     if (word_buf && left_buf && right_buf) {
         display_reset();
@@ -404,24 +475,68 @@ static void format_word(const char *word)
     sync_word_positions();
 }
 
+static void clear_word_display(void)
+{
+    if (!left_label || !left_bold_label || !anchor_label || !anchor_bold_label || !right_label || !right_bold_label) {
+        return;
+    }
+
+    lv_label_set_text(left_bold_label, "");
+    lv_label_set_text(left_label, "");
+    lv_label_set_text(anchor_bold_label, "");
+    lv_label_set_text(anchor_label, "");
+    lv_label_set_text(right_bold_label, "");
+    lv_label_set_text(right_label, "");
+}
+
 static void next_word_cb(lv_timer_t *timer)
 {
     char *chunk_start;
     size_t chunk_len;
+    uint32_t delay_ms;
 
     if (!word_buf || !left_buf || !right_buf) {
         return;
     }
-    if (!next_chunk(&chunk_start, &chunk_len)) {
+
+    if (pending_blank_delay_ms > 0) {
+        clear_word_display();
+        if (timer) {
+            lv_timer_set_period(timer, pending_blank_delay_ms);
+        }
+        pending_blank_delay_ms = 0;
         return;
     }
 
-    memcpy(word_buf, chunk_start, chunk_len);
-    word_buf[chunk_len] = '\0';
+    for (;;) {
+        if (!next_chunk(&chunk_start, &chunk_len)) {
+            if (timer) {
+                lv_timer_pause(timer);
+            }
+            reader_paused = true;
+            if (speed_label) {
+                lv_label_set_text_fmt(speed_label, "%u WPM  END", reading_speed_wpm);
+            }
+            return;
+        }
 
-    format_word(word_buf);
-    if (timer) {
-        lv_timer_set_period(timer, get_word_delay_ms(word_buf));
+        memcpy(word_buf, chunk_start, chunk_len);
+        word_buf[chunk_len] = '\0';
+        delay_ms = get_word_delay_ms(word_buf, &pending_blank_delay_ms);
+
+        if (is_paragraph_break_token(word_buf)) {
+            clear_word_display();
+            if (timer) {
+                lv_timer_set_period(timer, delay_ms);
+            }
+            return;
+        }
+
+        format_word(word_buf);
+        if (timer) {
+            lv_timer_set_period(timer, delay_ms);
+        }
+        return;
     }
 }
 
@@ -908,6 +1023,29 @@ static void render_jump_custom_menu(lv_obj_t *screen)
 
 static void render_current_screen(void);
 
+static void record_user_activity(void)
+{
+    last_activity_tick = lv_tick_get();
+}
+
+static bool ui_is_idle_for_auto_sleep(void)
+{
+    if (current_screen == UI_SCREEN_READER && !reader_paused) {
+        return false;
+    }
+
+    return true;
+}
+
+static void enter_device_sleep(void)
+{
+    display_save_position();
+    RGB_SaveState();
+    RGB_SetEnabled(false);
+    LCD_EnterSleep();
+    esp_deep_sleep_start();
+}
+
 static void render_reader_screen(lv_obj_t *screen)
 {
     const lv_font_t *word_font = get_word_font();
@@ -1141,11 +1279,7 @@ static void handle_long_press(void)
             push_screen(UI_SCREEN_LED);
             break;
         case 6:
-            display_save_position();
-            RGB_SaveState();
-            RGB_SetEnabled(false);
-            LCD_EnterSleep();
-            esp_deep_sleep_start();
+            enter_device_sleep();
             return;
         default:
             current_screen = UI_SCREEN_MENU;
@@ -1272,6 +1406,7 @@ static void button_poll_cb(lv_timer_t *timer)
 
     if (button_stable_pressed != button_raw_pressed) {
         button_stable_pressed = button_raw_pressed;
+        record_user_activity();
 
         if (button_stable_pressed) {
             button_press_tick = now;
@@ -1297,6 +1432,12 @@ finalize_clicks:
     if (pending_clicks == 1 && (now - last_click_tick) > BUTTON_DOUBLE_CLICK_MS) {
         pending_clicks = 0;
         handle_single_press();
+    }
+
+    if (inactivity_sleep_ms > 0 &&
+        ui_is_idle_for_auto_sleep() &&
+        (now - last_activity_tick) >= inactivity_sleep_ms) {
+        enter_device_sleep();
     }
 }
 
@@ -1333,5 +1474,6 @@ void display_words_start(void)
     jump_digit_stage = 0;
     brightness_menu_index = get_brightness_menu_index();
     led_menu_index = get_led_menu_index();
+    record_user_activity();
     render_current_screen();
 }

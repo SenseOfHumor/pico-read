@@ -47,6 +47,22 @@ source ~/esp/esp-idf/export.sh
 
 ## Build
 
+Use this exact shell flow if you have been switching between Python environments:
+
+```bash
+deactivate 2>/dev/null || true
+cd /Users/dream/Documents/GitHub/pico-read/esp32-c6-gui
+source /Users/dream/esp/esp-idf/export.sh
+which python
+which idf.py
+idf.py --version
+idf.py build
+```
+
+The expected result is that `which python` points into the Espressif environment under `~/.espressif/...`, not the repo-local `.venv`.
+
+Minimal build-only command:
+
 ```bash
 cd esp32-c6-gui
 idf.py build
@@ -69,7 +85,23 @@ Then unplug the board, run it again, plug the board back in, and run it again. T
 - `/dev/cu.usbmodem...`
 - `/dev/cu.SLAB_USBtoUART`
 
-Flash with the actual port:
+Full build + flash workflow:
+
+```bash
+deactivate 2>/dev/null || true
+cd /Users/dream/Documents/GitHub/pico-read/esp32-c6-gui
+source /Users/dream/esp/esp-idf/export.sh
+ls /dev/cu.*
+which python
+which idf.py
+idf.py --version
+idf.py build
+idf.py -p /dev/cu.usbmodem1101 flash
+```
+
+Replace `/dev/cu.usbmodem1101` with the real port you found from `ls /dev/cu.*`.
+
+Flash-only command with the actual port:
 
 ```bash
 cd esp32-c6-gui
@@ -100,6 +132,29 @@ If the board does not enter download mode automatically:
 2. Tap `RESET`.
 3. Release `BOOT`.
 4. Run the flash command again.
+
+If you want a reusable upload script, this is the exact version to run from the repo root after replacing the port:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+deactivate 2>/dev/null || true
+cd /Users/dream/Documents/GitHub/pico-read/esp32-c6-gui
+source /Users/dream/esp/esp-idf/export.sh
+
+which python
+which idf.py
+idf.py --version
+idf.py build
+idf.py -p /dev/cu.usbmodem1101 flash
+```
+
+If you save that as `flash.sh`, make it executable with:
+
+```bash
+chmod +x flash.sh
+```
 
 ## Updating Books
 
